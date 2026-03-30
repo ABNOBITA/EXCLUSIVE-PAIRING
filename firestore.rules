@@ -1,0 +1,132 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: userId (UID)
+    // Fields:
+    //   - uid: string (required)
+    //   - email: string (required)
+    //   - displayName: string
+    //   - photoURL: string
+    //   - pairId: string (optional)
+    //   - pairingCode: string (optional)
+    //   - chatId: string (optional)
+    //
+    // Collection: chats
+    // Document ID: chatId
+    // Fields:
+    //   - participants: list<string> (required, size 2)
+    //   - createdAt: timestamp
+    //
+    // Collection: chats/{chatId}/messages
+    // Document ID: messageId
+    // Fields:
+    //   - text: string (required, < 1000 chars)
+    //   - senderId: string (required)
+    //   - timestamp: timestamp (required)
+    //   - read: bool
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isParticipant(chatId) {
+      return isAuthenticated() && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
+    }
+
+    function isChatParticipant(chatData) {
+      return isAuthenticated() && request.auth.uid in chatData.participants;
+    }
+
+    function hasRequiredFields(data, fields) {
+      return data.keys().hasAll(fields);
+    }
+
+    function hasOnlyAllowedFields(data, fields) {
+      return data.keys().hasOnly(fields);
+    }
+
+    function isValidUser(data) {
+      return hasRequiredFields(data, ['uid', 'email']) &&
+             data.uid is string &&
+             data.email is string &&
+             (!('displayName' in data) || (data.displayName is string && data.displayName.size() < 100)) &&
+             (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() < 500)) &&
+             (!('pairId' in data) || (data.pairId is string && data.pairId.size() < 50)) &&
+             (!('pairingCode' in data) || (data.pairingCode is string && data.pairingCode.size() < 20)) &&
+             (!('chatId' in data) || (data.chatId is string && data.chatId.size() < 100));
+    }
+
+    function isValidChat(data) {
+      return hasRequiredFields(data, ['participants']) &&
+             data.participants is list &&
+             data.participants.size() == 2 &&
+             request.auth.uid in data.participants;
+    }
+
+    function isValidMessage(data) {
+      return hasRequiredFields(data, ['text', 'senderId', 'timestamp']) &&
+             data.text is string && data.text.size() > 0 && data.text.size() < 1000 &&
+             data.senderId == request.auth.uid &&
+             data.timestamp is timestamp;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      // Users can read their own profile
+      // Allow list for pairing code search (must filter by pairingCode)
+      allow read: if isAuthenticated();
+      
+      allow create: if isOwner(userId) && isValidUser(request.resource.data);
+      
+      allow update: if isAuthenticated() && 
+                    isValidUser(request.resource.data) &&
+                    (
+                      isOwner(userId) || 
+                      // Allow another user to update pairId if they are pairing
+                      (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['pairId', 'chatId']))
+                    );
+    }
+
+    match /chats/{chatId} {
+      allow read: if isParticipant(chatId);
+      
+      allow create: if isValidChat(request.resource.data);
+      
+      allow update: if isParticipant(chatId) && isValidChat(request.resource.data);
+
+      match /messages/{messageId} {
+        allow read: if isParticipant(chatId);
+        allow create: if isParticipant(chatId) && isValidMessage(request.resource.data);
+        allow update: if isParticipant(chatId) && 
+                      (
+                        // Allow sender to update text (maybe?) or recipient to update 'read'
+                        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read'])
+                      );
+      }
+    }
+    
+    // Default deny
+    match /{path=**} {
+      allow read, write: if false;
+    }
+  }
+}
